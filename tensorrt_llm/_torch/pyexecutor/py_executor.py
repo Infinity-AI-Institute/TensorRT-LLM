@@ -68,6 +68,7 @@ from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
 from .hang_detector import HangDetector, propagate_hard_kill
+from .iteration_timing import IterationTiming, create_iteration_timing_ledger
 from .kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache_stats import append_kv_cache_iteration_stats
 from .kv_cache_transceiver import (KvCacheTransceiver,
@@ -376,6 +377,7 @@ class BatchState:
     gpu_forward_start_event: Optional[torch.cuda.Event] = None
     gpu_forward_end_event: Optional[torch.cuda.Event] = None
     gpu_forward_events_from_perf_pool: bool = False
+    iteration_id: int = -1
 
 
 @dataclasses.dataclass
@@ -955,6 +957,7 @@ class PyExecutor:
         # under steady state — see ping-pong comment in _profiler).
         self._latest_host_step_time_ms: Optional[float] = None
         self._latest_prev_device_step_time_ms: Optional[float] = None
+        self._iteration_timing_ledger = None
         self._emit_initial_stats()
         self.gather_all_responses = False
 
@@ -1255,6 +1258,12 @@ class PyExecutor:
     def start_worker(self):
         with self.worker_lock:
             if not self.worker_started:
+                if (self.dist.pp_size == 1
+                        and not self.disable_overlap_scheduler):
+                    self._iteration_timing_ledger = \
+                        create_iteration_timing_ledger(
+                            rank=self.global_rank,
+                            overlap_scheduler=True)
                 if self.dist.pp_size > 1:
                     self.executed_batch_queue: Queue[BatchStatePP] = Queue(
                         maxsize=self.num_micro_batches)
@@ -2450,6 +2459,10 @@ class PyExecutor:
             self.is_shutdown = True
             self.response_cv.notify_all()
         self.shutdown_event.set()
+
+        if self._iteration_timing_ledger is not None:
+            self._iteration_timing_ledger.close()
+            self._iteration_timing_ledger = None
 
         for i in range(self.num_micro_batches):
             try:
@@ -3647,11 +3660,17 @@ class PyExecutor:
         any_rank_terminal_no_fit = any(status[1] for status in all_rank_status)
         return all_ranks_fetched and any_rank_terminal_no_fit
 
-    def _prepare_and_schedule_batch(self):
+    def _prepare_and_schedule_batch(
+            self, iteration_timing: Optional[IterationTiming] = None):
+        admission_start_ns = (time.perf_counter_ns()
+                              if iteration_timing is not None else 0)
         self._sync_disagg_transfer_made_progress = False
         self._poll_encoder_steps()
         new_requests = self._fetch_and_activate_new_requests()
         if self.should_stop_processing:
+            if iteration_timing is not None:
+                iteration_timing.add_elapsed("request_update_admission_ns",
+                                             admission_start_ns)
             return None, None
 
         self._handle_control_request()
@@ -3732,8 +3751,15 @@ class PyExecutor:
                     continue
                 request.draft_tokens = [0] * self.max_total_draft_tokens
 
+        if iteration_timing is not None:
+            iteration_timing.add_elapsed("request_update_admission_ns",
+                                         admission_start_ns)
+            scheduler_start_ns = time.perf_counter_ns()
         scheduled_batch, scheduler_fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
+        if iteration_timing is not None:
+            iteration_timing.add_elapsed("scheduler_ns", scheduler_start_ns)
+            admission_start_ns = time.perf_counter_ns()
 
         if self.drafter is not None and not self.use_spec_decode:
             for request in scheduled_batch.all_requests():
@@ -3779,6 +3805,9 @@ class PyExecutor:
                 # Fail all active and waiting requests on every rank so every
                 # client receives an error instead of hanging.
                 self._handle_errors(error_msg, requests=self.active_requests)
+                if iteration_timing is not None:
+                    iteration_timing.add_elapsed("request_update_admission_ns",
+                                                 admission_start_ns)
                 return None, None
 
         self.num_scheduled_requests = scheduled_batch.batch_size
@@ -3787,6 +3816,17 @@ class PyExecutor:
             f'scheduled {scheduled_batch.num_encoder_requests} encoder requests, '
             f'{scheduled_batch.num_context_requests} context requests and '
             f'{scheduled_batch.num_generation_requests} generation requests')
+        if iteration_timing is not None:
+            iteration_timing.add_elapsed("request_update_admission_ns",
+                                         admission_start_ns)
+            iteration_timing.admitted_requests = len(new_requests)
+            iteration_timing.active_requests = len(self.active_requests)
+            iteration_timing.waiting_requests = len(self.waiting_queue)
+            iteration_timing.inbound_requests = \
+                self.executor_request_queue.get_request_queue_size()
+            iteration_timing.queued_requests = (
+                iteration_timing.waiting_requests +
+                iteration_timing.inbound_requests)
         return scheduled_batch, iter_stats
 
     def _kv_connector_start_batch(self, scheduled_batch):
@@ -4520,6 +4560,10 @@ class PyExecutor:
             while True:
                 self.hang_detector.checkpoint()
                 profile_step()
+                iteration_timing = (
+                    self._iteration_timing_ledger.start_iteration(
+                        self.iter_counter, self.is_warmup)
+                    if self._iteration_timing_ledger is not None else None)
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
@@ -4536,10 +4580,18 @@ class PyExecutor:
                 # modifies the host page table, so wait before scheduling.
                 # This wait is also needed for legacy scheduler, but it can
                 # be pushed later, e.g. before model_engine._prepare_inputs().
+                dependency_wait_start_ns = (time.perf_counter_ns() if
+                                            iteration_timing is not None else 0)
                 self._wait_for_model_engine_input_copy()
-                scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
+                if iteration_timing is not None:
+                    iteration_timing.add_elapsed("dependency_wait_ns",
+                                                 dependency_wait_start_ns)
+                scheduled_batch, iter_stats = self._prepare_and_schedule_batch(
+                    iteration_timing)
 
                 if scheduled_batch is None:
+                    if iteration_timing is not None:
+                        self._iteration_timing_ledger.emit(iteration_timing)
                     break
 
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
@@ -4550,12 +4602,17 @@ class PyExecutor:
                             self.kv_cache_manager.revert_allocate_generation(
                                 req)
                     self._finalize_adp_dummy_allocation(False)
+                    if iteration_timing is not None:
+                        self._iteration_timing_ledger.emit(iteration_timing)
                     continue
 
                 if not self._is_kv_manager_v2:
                     self._terminate_requests(scheduled_batch.paused_requests)
 
                 gpu_forward_events_from_perf_pool = False
+                resource_prepare_start_ns = (time.perf_counter_ns()
+                                             if iteration_timing is not None
+                                             else 0)
                 can_queue, can_queue_this_rank = self._can_queue(
                     scheduled_batch)
 
@@ -4602,6 +4659,10 @@ class PyExecutor:
 
                 if not can_queue and scheduled_batch.encoder_requests:
                     self._run_encoder_step(scheduled_batch.encoder_requests)
+
+                if iteration_timing is not None:
+                    iteration_timing.add_elapsed("kv_resource_prepare_ns",
+                                                 resource_prepare_start_ns)
 
                 # If the batch is not empty on this rank, but empty on other ranks,
                 # we need to delay the update of the previous batch's sample state,
@@ -4660,6 +4721,11 @@ class PyExecutor:
                     scheduled_batch_stats = (
                         self._collect_scheduled_batch_stats(scheduled_batch)
                         if self.enable_iter_perf_stats else None)
+                    if iteration_timing is not None:
+                        iteration_timing.set_batch_shape(
+                            scheduled_batch,
+                            self.model_engine.get_runtime_tokens_per_gen_step(
+                                self.model_engine.runtime_draft_len))
 
                     # GPU timing for perf metrics
                     gpu_forward_start, gpu_forward_end, gpu_sample_end = self.perf_manager.create_timing_events(
@@ -4676,12 +4742,25 @@ class PyExecutor:
                             gpu_forward_start, gpu_forward_end) as fwd_timing:
                         batch_outputs = self._forward_step(
                             scheduled_batch, previous_tensors_device,
-                            num_accepted_tokens_device)
+                            num_accepted_tokens_device, iteration_timing)
 
                     self._maybe_prefetch_next_iter_mm_encoders(scheduled_batch)
 
                 if self.previous_batch is not None and should_process_previous_batch:
-                    self._update_requests(self.previous_batch.sample_state)
+                    request_update_start_ns = (time.perf_counter_ns()
+                                               if iteration_timing is not None
+                                               else 0)
+                    self._update_requests(self.previous_batch.sample_state,
+                                          iteration_timing=iteration_timing,
+                                          completed_batch_iteration_id=self.
+                                          previous_batch.iteration_id)
+                    if iteration_timing is not None:
+                        iteration_timing.add_elapsed(
+                            "request_update_admission_ns",
+                            request_update_start_ns)
+                output_handling_start_ns = (time.perf_counter_ns() if
+                                            iteration_timing is not None else 0)
+                if self.previous_batch is not None and should_process_previous_batch:
                     # Turning off speculative decoding when Acceptance Rate is low.
                     # In overlap scheduler path, it will do an extra iter with spec decode on.
                     if self.speculation_gate is not None:
@@ -4717,8 +4796,15 @@ class PyExecutor:
                 if not self._is_kv_manager_v2:
                     self._pause_requests(scheduled_batch.paused_requests)
 
+                if iteration_timing is not None:
+                    iteration_timing.add_elapsed("output_handling_ns",
+                                                 output_handling_start_ns)
+
                 if can_queue:
                     guided_decoder_failed_requests = None
+                    output_handling_start_ns = (time.perf_counter_ns()
+                                                if iteration_timing is not None
+                                                else 0)
                     with self.perf_manager.record_perf_events(
                             None, gpu_sample_end) as sample_timing:
                         if self.guided_decoder is not None:
@@ -4737,11 +4823,21 @@ class PyExecutor:
                     # causing _sample_async to fail when accessing context_chunk_size property.
                     self._handle_guided_decoder_errors(
                         scheduled_batch, guided_decoder_failed_requests)
+                    if iteration_timing is not None:
+                        iteration_timing.add_elapsed("output_handling_ns",
+                                                     output_handling_start_ns)
                     # _update_request_states() can terminate attention-DP
                     # dummy requests, which frees V2 KV pages and overwrites
                     # host page-index entries with BAD_PAGE_INDEX. Wait until
                     # the current input preparation has consumed those buffers.
+                    dependency_wait_start_ns = (time.perf_counter_ns()
+                                                if iteration_timing is not None
+                                                else 0)
                     self._wait_for_model_engine_input_copy()
+                    if iteration_timing is not None:
+                        iteration_timing.add_elapsed("dependency_wait_ns",
+                                                     dependency_wait_start_ns)
+                        output_handling_start_ns = time.perf_counter_ns()
                     self._update_request_states(scheduled_batch)
 
                     # Update context requests' KV cache so that sliding-window
@@ -4752,20 +4848,45 @@ class PyExecutor:
                             and scheduled_batch.context_requests):
                         self.kv_cache_manager.update_context_resources(
                             scheduled_batch)
+                    if iteration_timing is not None:
+                        iteration_timing.add_elapsed("output_handling_ns",
+                                                     output_handling_start_ns)
 
                 if self.previous_batch is not None and should_process_previous_batch:
+                    output_handling_start_ns = (time.perf_counter_ns()
+                                                if iteration_timing is not None
+                                                else 0)
                     self._commit_kv_cache_stats(
                         self.previous_batch.scheduled_requests)
                     # _process_previous_batch may terminate requests or resize
                     # generation KV caches, both of which can mutate V2 page
                     # indices used by the current batch's input preparation.
+                    if iteration_timing is not None:
+                        iteration_timing.add_elapsed("output_handling_ns",
+                                                     output_handling_start_ns)
+                        dependency_wait_start_ns = time.perf_counter_ns()
                     self._wait_for_model_engine_input_copy()
+                    if iteration_timing is not None:
+                        iteration_timing.add_elapsed("dependency_wait_ns",
+                                                     dependency_wait_start_ns)
+                        output_handling_start_ns = time.perf_counter_ns()
                     self._process_previous_batch()
                     self.perf_manager.compute_batch_gpu_times(
                         self.previous_batch.scheduled_requests.all_requests())
+                    if iteration_timing is not None:
+                        iteration_timing.add_elapsed("output_handling_ns",
+                                                     output_handling_start_ns)
                 else:
+                    output_handling_start_ns = (time.perf_counter_ns()
+                                                if iteration_timing is not None
+                                                else 0)
                     self._enqueue_responses([])
+                    if iteration_timing is not None:
+                        iteration_timing.add_elapsed("output_handling_ns",
+                                                     output_handling_start_ns)
 
+                output_handling_start_ns = (time.perf_counter_ns() if
+                                            iteration_timing is not None else 0)
                 # Drain buffers from the (per-rank-divergent)
                 # _process_previous_batch above; rank-symmetric companion to
                 # the _enqueue_responses([]) call in the else branch.
@@ -4796,7 +4917,8 @@ class PyExecutor:
                         gpu_forward_start_event=gpu_forward_start,
                         gpu_forward_end_event=gpu_forward_end,
                         gpu_forward_events_from_perf_pool=
-                        gpu_forward_events_from_perf_pool)
+                        gpu_forward_events_from_perf_pool,
+                        iteration_id=self.iter_counter)
                 elif not can_queue_this_rank:
                     # If the batch is empty on this rank, we need to clear the previous batch.
                     self.previous_batch = None
@@ -4806,6 +4928,18 @@ class PyExecutor:
                     self._check_kv_transfer_timeout()
 
                 self._kv_connector_terminate_requests()
+
+                if iteration_timing is not None:
+                    iteration_timing.add_elapsed("output_handling_ns",
+                                                 output_handling_start_ns)
+                    iteration_timing.active_requests = len(self.active_requests)
+                    iteration_timing.waiting_requests = len(self.waiting_queue)
+                    iteration_timing.inbound_requests = \
+                        self.executor_request_queue.get_request_queue_size()
+                    iteration_timing.queued_requests = (
+                        iteration_timing.waiting_requests +
+                        iteration_timing.inbound_requests)
+                    self._iteration_timing_ledger.emit(iteration_timing)
 
                 self.iter_counter += 1
 
@@ -6706,11 +6840,11 @@ class PyExecutor:
                 f"Cross-iter MM encoder prefetch failed; falling back to "
                 f"in-iter encode.\n{traceback.format_exc()}")
 
-    def _forward_step(
-            self,
-            scheduled_requests: ScheduledRequests,
-            new_tensors_device: Optional[SampleStateTensors] = None,
-            num_accepted_tokens_device: Optional[torch.Tensor] = None):
+    def _forward_step(self,
+                      scheduled_requests: ScheduledRequests,
+                      new_tensors_device: Optional[SampleStateTensors] = None,
+                      num_accepted_tokens_device: Optional[torch.Tensor] = None,
+                      iteration_timing: Optional[IterationTiming] = None):
         ExpertStatistic.set_iter(self.iter_counter)
 
         num_ctx_tokens = sum(req.context_chunk_size
@@ -6721,14 +6855,26 @@ class PyExecutor:
         )
         def forward(scheduled_requests, resource_manager, new_tensors_device,
                     gather_context_logits, cache_indirection_buffer,
-                    num_accepted_tokens_device):
-            return self.model_engine.forward(
-                scheduled_requests,
-                resource_manager,
-                new_tensors_device,
-                gather_context_logits=gather_context_logits,
-                cache_indirection_buffer=cache_indirection_buffer,
-                num_accepted_tokens_device=num_accepted_tokens_device)
+                    num_accepted_tokens_device, iteration_timing):
+            if iteration_timing is None:
+                return self.model_engine.forward(
+                    scheduled_requests,
+                    resource_manager,
+                    new_tensors_device,
+                    gather_context_logits=gather_context_logits,
+                    cache_indirection_buffer=cache_indirection_buffer,
+                    num_accepted_tokens_device=num_accepted_tokens_device)
+            self.model_engine._pyexecutor_iteration_timing = iteration_timing
+            try:
+                return self.model_engine.forward(
+                    scheduled_requests,
+                    resource_manager,
+                    new_tensors_device,
+                    gather_context_logits=gather_context_logits,
+                    cache_indirection_buffer=cache_indirection_buffer,
+                    num_accepted_tokens_device=num_accepted_tokens_device)
+            finally:
+                self.model_engine._pyexecutor_iteration_timing = None
 
         try:
             gather_context_logits = any(
@@ -6744,7 +6890,7 @@ class PyExecutor:
                 outputs = forward(scheduled_requests, self.resource_manager,
                                   new_tensors_device, gather_context_logits,
                                   cache_indirection_buffer,
-                                  num_accepted_tokens_device)
+                                  num_accepted_tokens_device, iteration_timing)
                 self._mark_cross_kv_projection_consumed(scheduled_requests)
 
             # Ensure the default stream waits for execution_stream to complete
@@ -6880,9 +7026,15 @@ class PyExecutor:
     @nvtx_range("_update_requests")
     def _update_requests(self,
                          sample_state: SampleState,
-                         resource_manager: Optional[ResourceManager] = None):
+                         resource_manager: Optional[ResourceManager] = None,
+                         iteration_timing: Optional[IterationTiming] = None,
+                         completed_batch_iteration_id: int = -1):
         try:
             self.sampler.update_requests(sample_state, resource_manager)
+            if iteration_timing is not None:
+                iteration_timing.set_completed_mtp(
+                    completed_batch_iteration_id,
+                    getattr(sample_state, "requests", ()))
             self._accumulate_spec_dec_stats(sample_state)
         except Exception as e:
             traceback.print_exc()

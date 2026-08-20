@@ -130,6 +130,57 @@ The Nsight Systems reports will be saved to `trace.nsys-rep`. Use NVIDIA Nsight 
 
 The PyTorch profiler results will be saved to `trace.json`. Use [chrome://tracing/](chrome://tracing/) to inspect the saved profile.
 
+## PyExecutor mixed-cycle host timing ledger
+
+The overlap scheduler can optionally write one low-overhead JSONL record for
+each completed PyExecutor host iteration. The ledger is intended to explain
+mixed prefill/decode gaps before collecting a more intrusive system trace. It
+is disabled by default and the disabled path does not read a clock, create a
+thread, or open a file.
+
+Set a path before launching `trtllm-serve`. Use the placeholders when running
+more than one rank or process so writers never share a file:
+
+```bash
+TLLM_PYEXECUTOR_TIMING_LEDGER_PATH=/tmp/pyexecutor-{pid}-rank{rank}.jsonl \
+trtllm-serve MODEL --config config.yaml
+```
+
+`TLLM_PYEXECUTOR_TIMING_LEDGER_QUEUE_SIZE` changes the bounded asynchronous
+writer queue from its default of 8192 records. The executor never blocks when
+the queue is full. The final `ledger_end` row reports `dropped_records`; do not
+analyze an incomplete ledger as full workload coverage.
+
+Every iteration row contains:
+
+- `iteration_id`, monotonic `start_ns`/`end_ns`, `total_ns`, and mutually
+  exclusive host durations for dependency waits, request update/admission,
+  scheduling, KV/resource preparation, input packing, model/graph launch, and
+  output handling. `other_ns` is the unclassified remainder;
+  `phase_overflow_ns` must remain zero and exposes any accidental overlap.
+- active, queued, admitted, context, and decode request counts plus scheduled
+  tokens.
+- whether a CUDA graph was selected, its batch and draft-length key, and the
+  number of padded request rows.
+- scheduled MTP draft slots. With overlap scheduling, acceptance becomes known
+  while processing the preceding batch, so `completed_batch_iteration_id`
+  identifies the batch for `completed_mtp_draft_tokens` and
+  `completed_mtp_accepted_tokens`.
+
+The durations are host-wall attribution from `time.perf_counter_ns`; the
+instrumentation adds no CUDA events and never synchronizes the device.
+Consequently, `graph_launch_ns` is the host span that enqueues an eager forward
+or CUDA graph replay, not GPU execution time. `dependency_wait_ns` measures
+only waits already required by the executor. Asynchronous GPU work can outlive
+the host phase that launched it. Join the ledger to TensorRT-LLM iteration IDs
+and use Nsight Systems when GPU overlap or stream-idle time is the question.
+
+The initial implementation covers the single-stage overlap scheduler. Pipeline
+parallel and `disable_overlap_scheduler=True` loops are not yet attributed.
+Always compare an exact workload with the ledger disabled and enabled before
+using it for timing diagnosis; the enabled path performs clock reads, builds a
+small Python record, and enqueues it to a background writer.
+
 ## MoE Expert Load Balance Analysis (Perfect Router)
 
 For Mixture-of-Experts (MoE) models, performance can vary significantly based on how tokens are routed to experts. Uneven expert load distribution can cause some GPUs to be overloaded while others are underutilized, leading to suboptimal throughput.

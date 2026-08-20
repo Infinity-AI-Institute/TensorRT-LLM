@@ -8,6 +8,7 @@ import gc
 import inspect
 import math
 import os
+import time
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
@@ -82,6 +83,7 @@ from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
                                 EncoderCUDAGraphRunner,
                                 EncoderCUDAGraphRunnerConfig)
 from .guided_decoder import CapturableGuidedDecoder
+from .iteration_timing import IterationTiming
 from .kv_cache_manager_v2 import KVCacheManagerV2
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import (LlmRequest, LlmRequestState, get_draft_token_length,
@@ -6971,6 +6973,10 @@ class PyTorchModelEngine(ModelEngine):
                 cache_indirection_buffer: Optional[torch.Tensor] = None,
                 num_accepted_tokens_device: Optional[torch.Tensor] = None,
                 req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None):
+        iteration_timing: Optional[IterationTiming] = getattr(
+            self, '_pyexecutor_iteration_timing', None)
+        input_pack_start_ns = (time.perf_counter_ns()
+                               if iteration_timing is not None else 0)
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(
@@ -7043,16 +7049,29 @@ class PyTorchModelEngine(ModelEngine):
                 scheduled_requests, attn_metadata, spec_metadata,
                 resource_manager)
 
+            if iteration_timing is not None:
+                iteration_timing.set_graph_shape(used=False,
+                                                 batch_size=None,
+                                                 draft_len=None,
+                                                 padding_rows=0)
+                iteration_timing.add_elapsed("input_pack_ns",
+                                             input_pack_start_ns)
+                graph_launch_start_ns = time.perf_counter_ns()
+
             with MoeLoadBalancerIterContext(moe_load_balancer):
                 # Special handling for multimodal encoder only mode
                 if self.llm_args.mm_encoder_only:
-                    return self._forward_step_mm_encoder_only(
+                    outputs = self._forward_step_mm_encoder_only(
                         inputs, scheduled_requests)
                 else:
-                    return self._forward_step(
+                    outputs = self._forward_step(
                         inputs,
                         gather_ids=gather_ids,
                         gather_context_logits=gather_context_logits)
+            if iteration_timing is not None:
+                iteration_timing.add_elapsed("graph_launch_ns",
+                                             graph_launch_start_ns)
+            return outputs
 
         graph_requests = scheduled_requests
         promoted_context_request_ids: frozenset[int] = frozenset()
@@ -7129,6 +7148,15 @@ class PyTorchModelEngine(ModelEngine):
                 execution_requests = scheduled_requests
                 execution_promoted_context_ids = frozenset()
 
+            if iteration_timing is not None:
+                iteration_timing.set_graph_shape(
+                    used=can_run_graph,
+                    batch_size=key.batch_size if key is not None else None,
+                    draft_len=key.draft_len if key is not None else None,
+                    padding_rows=(execution_requests.batch_size -
+                                  scheduled_requests.batch_size),
+                )
+
             # Fill slot-ID buffer for scatter inside draft loop
             if (self.enable_spec_decode and spec_tree_manager is not None
                     and spec_tree_manager.use_dynamic_tree
@@ -7153,6 +7181,11 @@ class PyTorchModelEngine(ModelEngine):
                     'num_generation_tokens'] = scheduled_requests.num_generation_requests
             self._prepare_inputs_event = torch.cuda.Event()
             self._prepare_inputs_event.record()
+
+            if iteration_timing is not None:
+                iteration_timing.add_elapsed("input_pack_ns",
+                                             input_pack_start_ns)
+                graph_launch_start_ns = time.perf_counter_ns()
 
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
                 if not can_run_graph:
@@ -7205,10 +7238,19 @@ class PyTorchModelEngine(ModelEngine):
                             restore_attn_metadata_after_draft_replay(
                                 attn_metadata, saved_draft)
 
+            if iteration_timing is not None:
+                iteration_timing.add_elapsed("graph_launch_ns",
+                                             graph_launch_start_ns)
+                output_handling_start_ns = time.perf_counter_ns()
+
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
 
             self._execute_logit_post_processors(scheduled_requests, outputs)
+
+            if iteration_timing is not None:
+                iteration_timing.add_elapsed("output_handling_ns",
+                                             output_handling_start_ns)
 
             return outputs
 
