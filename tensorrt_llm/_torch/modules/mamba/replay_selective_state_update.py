@@ -20,6 +20,8 @@
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/selective_state_update.py
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -3350,6 +3352,17 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
         ),  # raw_batch=1024, score=170.51us (B200 PDL-retune noise-cleaned 5x500)
     ],
 }
+
+_ISSUE18_TUNING_ENV = "TRTLLM_REPLAY_SSU_B300_TP1_TUNING"
+
+
+def _issue18_tuning_enabled() -> bool:
+    value = os.environ.get(_ISSUE18_TUNING_ENV, "1")
+    if value not in ("0", "1"):
+        raise ValueError(f"{_ISSUE18_TUNING_ENV} must be 0 or 1, got {value!r}")
+    return value == "1"
+
+
 _PD_TO_PM_SPLIT_MAP = {  # pd unsplit knob -> (pm_write_knob, pm_nowrite_knob)
     "_block_size_m": ("_block_size_m_write", "_block_size_m_nowrite"),
     "_num_warps": ("_num_warps_write", "_num_warps_nowrite"),
@@ -3420,12 +3433,19 @@ def _resolve_tuning(
     elif dt_str == "fp8":
         keys_to_try.append(("int8", "SR"))
     entries = None
+    resolved_key = None
     for k in keys_to_try:
         if k in _DEFAULT_TUNING:
             entries = _DEFAULT_TUNING[k]
+            resolved_key = k
             break
     if entries is None:
         return None
+    if resolved_key == ("fp16", "SR") and not _issue18_tuning_enabled():
+        # Explicit operational rollback to the last stock cell.  Keep this
+        # structural rather than duplicating its knobs so rollback tracks the
+        # exact accepted table when lower cells are maintained.
+        entries = entries[:-1]
     # Find first threshold >= eff_b; if none, use largest entry.
     for thresh, mode, knobs in entries:
         if eff_b <= thresh:
