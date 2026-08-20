@@ -8,10 +8,8 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
-
 SOURCE = (
-    Path(__file__).parents[5]
-    / "tensorrt_llm/_torch/modules/mamba/replay_selective_state_update.py"
+    Path(__file__).parents[5] / "tensorrt_llm/_torch/modules/mamba/replay_selective_state_update.py"
 )
 BASELINE_TABLE_SHA256 = "03867379fdcd69630512d319b2eadf7928d28eeb48ab2f57b674ac7e1544fab3"
 
@@ -19,7 +17,10 @@ BASELINE_TABLE_SHA256 = "03867379fdcd69630512d319b2eadf7928d28eeb48ab2f57b674ac7
 def _table():
     module = ast.parse(SOURCE.read_text())
     for node in module.body:
-        if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", None) == "_DEFAULT_TUNING":
+        if (
+            isinstance(node, ast.AnnAssign)
+            and getattr(node.target, "id", None) == "_DEFAULT_TUNING"
+        ):
             return ast.literal_eval(node.value)
     raise AssertionError("_DEFAULT_TUNING not found")
 
@@ -30,7 +31,10 @@ def _resolver_namespace():
     for node in module.body:
         if isinstance(node, ast.Import) and any(alias.name == "os" for alias in node.names):
             selected.append(node)
-        elif isinstance(node, ast.AnnAssign) and getattr(node.target, "id", None) == "_DEFAULT_TUNING":
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and getattr(node.target, "id", None) == "_DEFAULT_TUNING"
+        ):
             selected.append(node)
         elif isinstance(node, ast.Assign) and any(
             getattr(target, "id", None) == "_ISSUE18_TUNING_ENV" for target in node.targets
