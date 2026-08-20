@@ -2559,6 +2559,32 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "rectangle_for_nowrite": True,
             },
         ),  # raw_batch=1024, score=134.03us (B200 PDL-hoist default 5x200)
+        (
+            32768,
+            "persistent_main",
+            {
+                "_block_size_m_nowrite": 32,
+                "_block_size_m_write": 32,
+                "_cta_per_sm_nowrite": 6,
+                "_cta_per_sm_write": 8,
+                "_flatten": False,
+                "_heads_per_block": 4,
+                "_num_loop_stages_nowrite": 2,
+                "_num_loop_stages_write": 1,
+                "_num_stages_nowrite": 1,
+                "_num_stages_write": 3,
+                "_num_warps_nowrite": 2,
+                "_num_warps_write": 1,
+                "_precompute_num_warps": 1,
+                "_use_tma_rect_load": True,
+                "_use_tma_replay_nowrite_load": False,
+                "_use_tma_replay_write_load": True,
+                "_use_tma_replay_write_store": True,
+                "_warp_specialize": False,
+                "nowrite_first": True,
+                "rectangle_for_nowrite": True,
+            },
+        ),  # B300 TP1 C160/C192, T=4, fp16 SR focused tuning (#18)
     ],
     ("int8", "SR"): [
         (
