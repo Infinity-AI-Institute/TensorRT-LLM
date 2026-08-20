@@ -265,6 +265,14 @@ def _trtllm_gen_batch_decode_with_kv_cache(
         _get_bmm1_scale_log2(bmm1_scale) if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
     )
 
+    # FlashInfer main adds a transform-mode argument to the direct TRTLLM-Gen
+    # decode launcher. Mode 2 preserves separate K/V page indices while
+    # transforming BF16 Q for FP8 K/V; all other dtype combinations retain the
+    # legacy/default transform (mode 0).
+    bf16q_fp8kv_transform_mode = (
+        2 if query.dtype == torch.bfloat16 and kv_pool.dtype == torch.float8_e4m3fn else 0
+    )
+
     run_func = flashinfer.decode.get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
     sm_count = flashinfer.decode.get_device_sm_count(query.device)
     run_func(
@@ -300,6 +308,8 @@ def _trtllm_gen_batch_decode_with_kv_cache(
         0,  # lse_stride_tokens
         0,  # lse_stride_heads
         False,  # enable_block_sparse_attention (added in flashinfer 0.6.16, flashinfer-ai/flashinfer#3955)
+        None,  # sparse_mla_top_k_lens (added after 0.6.16)
+        bf16q_fp8kv_transform_mode,
     )
 
 
