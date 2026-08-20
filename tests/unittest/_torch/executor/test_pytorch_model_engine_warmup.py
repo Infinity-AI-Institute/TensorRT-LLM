@@ -20,7 +20,10 @@ import torch
 
 import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import (
+    PyTorchModelEngine,
+    _parse_mamba_mixed_warmup_shapes,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager,
     ResourceManager,
@@ -219,6 +222,39 @@ class TestWarmupCleanup(unittest.TestCase):
         assert encoder.call_count == 2
         assert warmup_states == [True, False]
         assert not runner.is_warmup_only
+
+    def test_parse_mamba_mixed_warmup_shapes(self):
+        self.assertEqual(
+            _parse_mamba_mixed_warmup_shapes(
+                "8016+8016+8016+8016+224:114;8016+8016+8016+8016+191:122"
+            ),
+            [
+                ([8016, 8016, 8016, 8016, 224], 114),
+                ([8016, 8016, 8016, 8016, 191], 122),
+            ],
+        )
+
+    def test_parse_mamba_mixed_warmup_shapes_rejects_invalid_entry(self):
+        for value in ("8016+0:114", "8016:-1", "8016", "bad:114"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                _parse_mamba_mixed_warmup_shapes(value)
+
+    def test_create_warmup_request_preserves_context_token_layout(self):
+        model_engine, resource_manager = _build_engine_and_resource_manager()
+        request = model_engine._create_warmup_request(
+            resource_manager,
+            num_tokens=19,
+            num_gen_requests=2,
+            context_token_nums=[3, 5, 9],
+        )
+
+        self.assertIsNotNone(request)
+        self.assertEqual(request.num_context_requests, 3)
+        self.assertEqual(request.num_generation_requests, 2)
+        self.assertEqual(
+            [context.py_prompt_len for context in request.context_requests],
+            [3, 5, 9],
+        )
 
     def test_empty_cache_fires_immediately_after_autotuner(self):
         """Change 1 placement: empty_cache must be the call right after

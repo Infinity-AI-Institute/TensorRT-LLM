@@ -96,6 +96,49 @@ from .sampler.ops.flashinfer import warmup_sampling_module
 from .scheduler import ScheduledRequests
 from .trace_log_utils import log_mem_snapshot
 
+_MAMBA_MIXED_WARMUP_SHAPES_ENV = "TLLM_MAMBA_MIXED_WARMUP_SHAPES"
+_MAMBA_MIXED_WARMUP_SHAPE_LIMIT = 16
+
+
+def _parse_mamba_mixed_warmup_shapes(value: str) -> List[Tuple[List[int], int]]:
+    """Parse ``context_lengths:generation_requests`` warmup entries.
+
+    Entries are separated by semicolons and context lengths by ``+``. For
+    example, ``8016+8016+224:114;8016+8016+191:122`` describes two mixed
+    batches. The total scheduled-token count is derived at runtime so the
+    active speculative-decoding depth is preserved.
+    """
+    if not value.strip():
+        return []
+
+    entries = value.split(";")
+    if len(entries) > _MAMBA_MIXED_WARMUP_SHAPE_LIMIT:
+        raise ValueError(f"{_MAMBA_MIXED_WARMUP_SHAPES_ENV} accepts at most "
+                         f"{_MAMBA_MIXED_WARMUP_SHAPE_LIMIT} shapes")
+
+    parsed = []
+    for entry in entries:
+        context_spec, separator, generation_spec = entry.partition(":")
+        try:
+            context_lengths = [
+                int(length) for length in context_spec.split("+")
+            ]
+            generation_requests = int(generation_spec)
+        except ValueError as error:
+            raise ValueError(
+                f"Invalid {_MAMBA_MIXED_WARMUP_SHAPES_ENV} entry "
+                f"{entry!r}; expected positive context lengths followed by "
+                "a non-negative generation-request count") from error
+        if (not separator or not context_spec or not generation_spec
+                or any(length <= 0 for length in context_lengths)
+                or generation_requests < 0):
+            raise ValueError(
+                f"Invalid {_MAMBA_MIXED_WARMUP_SHAPES_ENV} entry "
+                f"{entry!r}; expected positive context lengths followed by "
+                "a non-negative generation-request count")
+        parsed.append((context_lengths, generation_requests))
+    return parsed
+
 
 def _make_single_token_context_graph_batch(
     scheduled_requests: ScheduledRequests,
@@ -1831,6 +1874,12 @@ class PyTorchModelEngine(ModelEngine):
         Runs regardless of ``enable_autotuner``. Wraps in ``autotune()`` when
         the autotuner is enabled so op-level (M,N,K) caches also get primed
         for these shapes. Set ``TLLM_MAMBA_MULTISEQ_WARMUP=0`` to disable.
+
+        Set ``TLLM_MAMBA_MIXED_WARMUP_SHAPES`` to prewarm a finite set of
+        captured mixed layouts. The format is
+        ``context_len+context_len:generation_requests`` with shapes separated
+        by semicolons. Scheduled generation tokens are derived using the
+        active speculative depth; this does not change that depth or backend.
         """
         if os.environ.get("TLLM_MAMBA_MULTISEQ_WARMUP", "1") != "1":
             return
@@ -1871,11 +1920,29 @@ class PyTorchModelEngine(ModelEngine):
         logger.info(
             "Running Mamba hybrid warmup (multi-seq + HAS_INITSTATES=True)...")
 
-        # (num_tokens, num_gen_requests, least_requests, force_initstates)
+        # (num_tokens, num_gen_requests, least_requests, force_initstates,
+        #  context_token_nums)
         mamba_warmup_shapes = [
-            (capped_num_tokens, 0, False, False),
-            (capped_num_tokens, 0, False, True),
+            (capped_num_tokens, 0, False, False, None),
+            (capped_num_tokens, 0, False, True, None),
         ]
+
+        # Workload-specific mixed batches can have Triton specializations not
+        # covered by the bounded 4K multi-sequence warmup above. Keep this
+        # opt-in and finite: operators may materialize captured production
+        # layouts without changing the native backend or speculative depth.
+        mixed_shapes = _parse_mamba_mixed_warmup_shapes(
+            os.environ.get(_MAMBA_MIXED_WARMUP_SHAPES_ENV, ""))
+        runtime_tokens_per_gen_request = 1 + self.max_total_draft_tokens
+        for context_token_nums, num_gen_requests in mixed_shapes:
+            num_tokens = (sum(context_token_nums) +
+                          num_gen_requests * runtime_tokens_per_gen_request)
+            mamba_warmup_shapes.append(
+                (num_tokens, num_gen_requests, True, True, context_token_nums))
+            logger.info("Added captured Mamba mixed warmup shape: "
+                        f"context_token_nums={context_token_nums}, "
+                        f"num_gen_requests={num_gen_requests}, "
+                        f"num_tokens={num_tokens}")
 
         autotuner_enabled = self.llm_args.enable_autotuner
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
@@ -1883,8 +1950,8 @@ class PyTorchModelEngine(ModelEngine):
                         if autotuner_enabled else contextlib.nullcontext())
 
         with self.no_cuda_graph(), autotune_ctx:
-            for (num_tokens_i, num_gen_requests_i, least_req_i,
-                 force_init_i) in mamba_warmup_shapes:
+            for (num_tokens_i, num_gen_requests_i, least_req_i, force_init_i,
+                 context_token_nums_i) in mamba_warmup_shapes:
                 init_ctx = (Mamba2Metadata.force_initial_states_for_warmup()
                             if force_init_i else contextlib.nullcontext())
                 try:
@@ -1893,7 +1960,8 @@ class PyTorchModelEngine(ModelEngine):
                             resource_manager,
                             num_tokens_i,
                             num_gen_requests_i,
-                            least_requests=least_req_i)
+                            least_requests=least_req_i,
+                            context_token_nums=context_token_nums_i)
                         with self._release_batch_context(
                                 warmup_request, resource_manager) as batch:
                             if batch is None and self.mapping.tp_size <= 1:
@@ -1930,6 +1998,8 @@ class PyTorchModelEngine(ModelEngine):
                     logger.warning(f"Mamba hybrid warmup skipped for shape "
                                    f"num_tokens={num_tokens_i}, "
                                    f"num_gen_requests={num_gen_requests_i}, "
+                                   "context_token_nums="
+                                   f"{context_token_nums_i}, "
                                    f"force_initstates={force_init_i}: "
                                    f"{type(e).__name__}: {e}")
                     # Mirror _general_warmup_impl: an OOM between dispatch()
@@ -2541,11 +2611,13 @@ class PyTorchModelEngine(ModelEngine):
             return 0
 
     def _create_warmup_request(
-            self,
-            resource_manager: ResourceManager,
-            num_tokens: int,
-            num_gen_requests: int,
-            least_requests: bool = True) -> Optional[ScheduledRequests]:
+        self,
+        resource_manager: ResourceManager,
+        num_tokens: int,
+        num_gen_requests: int,
+        least_requests: bool = True,
+        context_token_nums: Optional[Sequence[int]] = None
+    ) -> Optional[ScheduledRequests]:
         """Creates a generic dummy ScheduledRequests object for warmup."""
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
@@ -2572,6 +2644,8 @@ class PyTorchModelEngine(ModelEngine):
 
         num_ctx_tokens = num_tokens - num_gen_tokens
         num_ctx_requests = 0
+        context_token_nums = (list(context_token_nums)
+                              if context_token_nums is not None else None)
         ctx_requests = []
         gen_requests = []
 
@@ -2587,7 +2661,14 @@ class PyTorchModelEngine(ModelEngine):
             return None
 
         if num_ctx_tokens > 0:
-            if least_requests:
+            if context_token_nums is not None:
+                if (not context_token_nums or any(num <= 0 or num > max_seq_len
+                                                  for num in context_token_nums)
+                        or sum(context_token_nums) != num_ctx_tokens
+                        or len(context_token_nums) > max_context_requests):
+                    return None
+                num_ctx_requests = len(context_token_nums)
+            elif least_requests:
                 num_full_seqs = num_ctx_tokens // max_seq_len
                 num_left_over_tokens = num_ctx_tokens - num_full_seqs * max_seq_len
 
@@ -2599,8 +2680,11 @@ class PyTorchModelEngine(ModelEngine):
                     num_full_seqs = max_bs - 1
                 max_seq_len = num_ctx_tokens // num_full_seqs
                 num_left_over_tokens = num_ctx_tokens - max_seq_len * num_full_seqs
-            num_ctx_requests = num_full_seqs + (1 if num_left_over_tokens > 0
-                                                else 0)
+            if context_token_nums is None:
+                num_ctx_requests = num_full_seqs + (1 if num_left_over_tokens
+                                                    > 0 else 0)
+        elif context_token_nums:
+            return None
 
         if num_ctx_requests + num_gen_requests > self.batch_size:
             return None  # Not enough batch size to fill the request
@@ -2622,11 +2706,16 @@ class PyTorchModelEngine(ModelEngine):
         extra_ctx_tokens = (getattr(kv_cache_manager, "num_extra_kv_tokens", 0)
                             or 0) + num_extra_decoding_steps
         extra_gen_tokens = extra_ctx_tokens + self.max_draft_loop_tokens
-        blocks_to_use = num_full_seqs * blocks_for_seq(max_seq_len +
-                                                       extra_ctx_tokens)
-        if num_left_over_tokens > 0:
-            blocks_to_use += blocks_for_seq(num_left_over_tokens +
-                                            extra_ctx_tokens)
+        if context_token_nums is not None:
+            blocks_to_use = sum(
+                blocks_for_seq(num + extra_ctx_tokens)
+                for num in context_token_nums)
+        else:
+            blocks_to_use = num_full_seqs * blocks_for_seq(max_seq_len +
+                                                           extra_ctx_tokens)
+            if num_left_over_tokens > 0:
+                blocks_to_use += blocks_for_seq(num_left_over_tokens +
+                                                extra_ctx_tokens)
         blocks_to_use += (num_gen_requests * self.max_beam_width *
                           blocks_for_seq(1 + extra_gen_tokens))
 
@@ -2635,13 +2724,14 @@ class PyTorchModelEngine(ModelEngine):
             return None
 
         if num_ctx_tokens > 0:
-            ctx_token_nums = [max_seq_len] * num_full_seqs
-            if num_left_over_tokens > 0:
-                ctx_token_nums.append(num_left_over_tokens)
+            if context_token_nums is None:
+                context_token_nums = [max_seq_len] * num_full_seqs
+                if num_left_over_tokens > 0:
+                    context_token_nums.append(num_left_over_tokens)
 
             ctx_requests = kv_cache_manager.add_dummy_requests(
                 list(range(num_ctx_requests)),
-                token_nums=ctx_token_nums,
+                token_nums=context_token_nums,
                 is_gen=False,
                 max_num_draft_tokens=self.max_total_draft_tokens,
                 kv_reserve_draft_tokens=self.max_draft_loop_tokens,
